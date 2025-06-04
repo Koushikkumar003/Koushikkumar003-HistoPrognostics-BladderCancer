@@ -20,7 +20,7 @@ HistoPrognostics is a deep learning framework designed to analyze histopathologi
 
 The framework has been validated on both synthetic datasets and real-world bladder cancer WSIs, achieving Area Under the Curve (AUC) scores of 0.721 for recurrence prediction and 0.678 for treatment outcome prediction.
 
-![Pipeline Overview](Images/Pipe_line%20overview.png)
+![Pipeline Overview](Images/Pipeline_overview.png)
 
 ## Getting Started
 
