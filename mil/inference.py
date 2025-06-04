@@ -1,303 +1,307 @@
 import os
-
 import pyvips
 import torch
 import numpy as np
 from timeit import default_timer as timer
-
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
-
-
 import skimage
 from skimage.filters import rank
 from skimage.morphology import disk
 from skimage.transform import resize
-
 from PIL import Image
 from scipy import ndimage
-from datasets_nmil import *
 import pandas as pd
 
 
-class MILInference():
-    def __init__(self, dir_wsi, dir_out, backbone, network, dir_inference, dir_images_regions, id='',
-                 virtual_batch_size=1, input_shape=(3, 224, 224), ori_patch_size=512):
-
+class MILInference:
+    """Multiple Instance Learning inference for whole slide images (WSI)"""
+    
+    def __init__(self, dir_wsi, dir_out, backbone, network, dir_inference, dir_images_regions, 
+                 input_shape=(3, 224, 224), ori_patch_size=512):
+        # Directory paths
         self.dir_wsi = dir_wsi
         self.dir_results = dir_out
         self.dir_inference = dir_inference
         self.dir_images_regions = dir_images_regions
-        if not os.path.exists(self.dir_results + self.dir_inference):
-            os.mkdir(self.dir_results + self.dir_inference)
-
-        # Other
-        self.init_time = 0
-        self.backbone = backbone
-        self.network = network
-        self.metrics = {}
-        self.id = id
-        self.virtual_batch_size = virtual_batch_size
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(self.dir_results + self.dir_inference, exist_ok=True)
+        
+        # Model components
+        self.backbone = backbone  # Feature extraction network
+        self.network = network    # MIL aggregation network
+        
+        # Configuration
         self.input_shape = input_shape
         self.ori_patch_size = ori_patch_size
-        self.current_wsi_subfolder = ''
-        self.current_wsi_name = ''
-        self.region_info_dataframe = ''
 
     def infer(self, current_wsi_subfolder):
+        """Run inference on a single WSI"""
+        # Extract WSI name and load region info
+        self.current_wsi_name = current_wsi_subfolder.split('/')[-1]
+        self.region_info_df = pd.read_csv(f"{self.dir_images_regions}{self.current_wsi_name}/region_info.csv")
+        
+        # Setup models on GPU
+        self.backbone.cuda().eval()
+        self.network.cuda().eval()
+        
+        output_dir = f"{self.dir_results}{self.dir_inference}{self.current_wsi_name}"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load WSI thumbnail
+        wsi_thumbnail = pyvips.Image.new_from_file(
+            f"{self.dir_wsi}{self.current_wsi_name}.mrxs", autocrop=True, level=4).flatten()
+        
+        # Run patch classification if not already done
+        patch_class_path = f"{output_dir}/patch_classification.npy"
+        if not os.path.exists(patch_class_path):
+            print(f'[Inference]: {self.current_wsi_name}')
+            
+            # Save thumbnail
+            thumb_save = pyvips.Image.new_from_file(
+                f"{self.dir_wsi}{self.current_wsi_name}.mrxs", autocrop=True, level=5).flatten()
+            thumb_save.jpegsave(f"{output_dir}/thumbnail.jpeg", Q=100)
+            
+            # Extract features and classify patches
+            patch_class, region_class, global_class = self._extract_features_and_classify(current_wsi_subfolder)
+            
+            # Save classifications
+            np.save(f"{output_dir}/patch_classification.npy", patch_class)
+            np.save(f"{output_dir}/region_classification.npy", region_class)
+            np.save(f"{output_dir}/global_classification.npy", global_class)
+        else:
+            # Load existing classifications
+            patch_class = np.load(f"{output_dir}/patch_classification.npy")
+            region_class = np.load(f"{output_dir}/region_classification.npy")
+            global_class = np.load(f"{output_dir}/global_classification.npy")
+        
+        # Normalize attention scores
+        self._normalize_attention(patch_class, region_class, output_dir)
+        
+        # Generate prediction visualizations
+        self._generate_visualizations(current_wsi_subfolder, patch_class, region_class, wsi_thumbnail, output_dir)
 
-        self.current_wsi_subfolder = current_wsi_subfolder
-        self.current_wsi_name = self.current_wsi_subfolder.split('/')[-1]
-        self.region_info_dataframe = pd.read_csv(self.dir_images_regions + self.current_wsi_name + '/region_info.csv')
-
-        # Move network to gpu
-        self.backbone.cuda()
-        self.backbone.eval()
-        self.network.cuda()
-        self.network.eval()
-
-
-        self.init_time = timer()
-
-        if not os.path.exists(self.dir_results + self.dir_inference + self.current_wsi_name):
-            os.mkdir(self.dir_results + self.dir_inference + self.current_wsi_name)
-
-            wsi_thumbnail = pyvips.Image.new_from_file(
-                self.dir_wsi + self.current_wsi_name + ".mrxs", autocrop=True, level=4).flatten()
-
-            if not os.path.exists(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/patch_classification.npy'):
-
-                # Loop over training dataset
-                print('[Inference]: {}'.format(self.current_wsi_subfolder.split('/')[-1]))
-
-                wsi_thumbnail = pyvips.Image.new_from_file(
-                    self.dir_wsi + self.current_wsi_name + ".mrxs", autocrop=True, level=4).flatten()
-                wsi_thumb_save = pyvips.Image.new_from_file(
-                    self.dir_wsi + self.current_wsi_name + ".mrxs", autocrop=True, level=5).flatten()
-                wsi_thumb_save.jpegsave(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/thumbnail.jpeg', Q=100)
-
-                features = []
-                region_info = []
-                for iInstance, current_patch_filename in enumerate(os.listdir(self.current_wsi_subfolder)):
-                    print(str(iInstance + 1) + '/' + str(len(os.listdir(self.current_wsi_subfolder))), end='\r')
-
-                    # Load patch
-                    x = Image.open(os.path.join(self.current_wsi_subfolder, current_patch_filename))
-                    x = np.asarray(x)
-                    # Normalization
-                    x = self.image_normalization(x)
-                    x = x[np.newaxis, ...]
-                    x = torch.tensor(x).cuda().float()
-
-                    # Transform image into low-dimensional embedding
-                    features.append(torch.squeeze(self.backbone(x)).detach().cpu().numpy())
-
-                    x_coor, y_coor = int(current_patch_filename.split('_')[0]), int(current_patch_filename.split('_')[1].split('.')[0])
-                    region_value = self.region_info_dataframe.loc[(self.region_info_dataframe['X_coor'] == x_coor) &
-                                                                  (self.region_info_dataframe['Y_coor'] == y_coor), 'Region'].item()
-                    region_info.append(region_value)
-                print('CNN Features: done')
-
-                # Compute attention and bag prediction
-                features = torch.tensor(np.array(features)).cuda().float()
-                region_info = torch.tensor(np.array(region_info)).cuda().float()
-                instance_classification = []
-                region_embeddings_list = []
-                for region_id in range(int(torch.max(region_info).item()) + 1):
-                    region_features = features[torch.where(region_info == region_id, True, False)]
-
-                    A_V = self.network.milAggregation.attentionModule.attention_V(region_features)  # Attention
-                    A_U = self.network.milAggregation.attentionModule.attention_U(region_features)  # Gate
-                    w_logits = self.network.milAggregation.attentionModule.attention_weights(
-                        A_V * A_U)  # Probabilities - softmax over instances
-                    instance_classification.append(w_logits)
-
-                    if not len(region_features) == 1:
-                        embedding_reg, _ = self.network.milAggregation(torch.squeeze(region_features))
-                        region_embeddings_list.append(embedding_reg)
-                    else:
-                        region_embeddings_list.append(torch.squeeze(region_features, dim=0))
-
-                if len(region_embeddings_list) == 1:
-                    patch_classification = w_logits
-                    embedding = embedding_reg
-                    A_V = self.network.milAggregation.attentionModule.attention_V(embedding_reg)  # Attention
-                    A_U = self.network.milAggregation.attentionModule.attention_U(embedding_reg)  # Gate
-                    w_logits = self.network.milAggregation.attentionModule.attention_weights(
-                        A_V * A_U)  # Probabilities - softmax over instances
-                else:
-                    embedding, _ = self.network.milAggregation(torch.squeeze(torch.stack(region_embeddings_list)))
-                    A_V = self.network.milAggregation.attentionModule.attention_V(
-                        torch.squeeze(torch.stack(region_embeddings_list)))  # Attention
-                    A_U = self.network.milAggregation.attentionModule.attention_U(
-                        torch.squeeze(torch.stack(region_embeddings_list)))  # Gate
-                    w_logits = self.network.milAggregation.attentionModule.attention_weights(
-                        A_V * A_U)  # Probabilities - softmax over instances
-                    patch_classification = torch.cat(instance_classification, dim=0)
-
-                # embedding, w = self.network.milAggregation.attentionModule(torch.squeeze(features))
-                global_classification = self.network.classifier(embedding).detach().cpu().numpy()
-
-                patch_classification = patch_classification.detach().cpu().numpy()
-
-                region_classification_aux = w_logits.detach().cpu().numpy()
-                region_classification = np.zeros(patch_classification.shape)
-
-                region_info = region_info.detach().cpu().numpy()
-
-                for i in range(len(region_info)):
-                    region_classification[i] = region_classification_aux[int(region_info[i])]
-
-                print('MIL classification: done')
-                np.save(self.dir_results + self.dir_inference + self.current_wsi_name + '/patch_classification.npy',
-                        patch_classification)
-                np.save(self.dir_results + self.dir_inference + self.current_wsi_name + '/region_classification.npy',
-                        region_classification)
-                np.save(self.dir_results + self.dir_inference + self.current_wsi_name + '/global_classification.npy',
-                        global_classification)
+    def _extract_features_and_classify(self, wsi_subfolder):
+        """Extract CNN features and perform MIL classification"""
+        features, region_info = [], []
+        patch_files = os.listdir(wsi_subfolder)
+        
+        # Extract features from each patch
+        for i, patch_file in enumerate(patch_files):
+            print(f"{i+1}/{len(patch_files)}", end='\r')
+            
+            # Load and preprocess patch
+            patch = Image.open(os.path.join(wsi_subfolder, patch_file))
+            patch = self._normalize_image(np.asarray(patch))
+            patch = torch.tensor(patch[np.newaxis, ...]).cuda().float()
+            
+            # Extract features using backbone
+            features.append(self.backbone(patch).squeeze().detach().cpu().numpy())
+            
+            # Get region info for this patch
+            x_coor = int(patch_file.split('_')[0])
+            y_coor = int(patch_file.split('_')[1].split('.')[0])
+            region_val = self.region_info_df.loc[
+                (self.region_info_df['X_coor'] == x_coor) & 
+                (self.region_info_df['Y_coor'] == y_coor), 'Region'].item()
+            region_info.append(region_val)
+        
+        print('CNN Features: done')
+        
+        # Convert to tensors
+        features = torch.tensor(np.array(features)).cuda().float()
+        region_info = torch.tensor(np.array(region_info)).cuda().float()
+        
+        # Perform MIL aggregation by regions
+        instance_class, region_embeddings = [], []
+        for region_id in range(int(torch.max(region_info).item()) + 1):
+            region_features = features[region_info == region_id]
+            
+            # Calculate attention weights for this region
+            attn_module = self.network.milAggregation.attentionModule
+            A_V = attn_module.attention_V(region_features)
+            A_U = attn_module.attention_U(region_features)
+            w_logits = attn_module.attention_weights(A_V * A_U)
+            instance_class.append(w_logits)
+            
+            # Get region embedding
+            if len(region_features) > 1:
+                embedding_reg, _ = self.network.milAggregation(region_features.squeeze())
+                region_embeddings.append(embedding_reg)
             else:
-                patch_classification = np.load(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/patch_classification.npy')
-                region_classification = np.load(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/region_classification.npy')
-                global_classification = np.load(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/global_classification.npy')
+                region_embeddings.append(region_features.squeeze(dim=0))
+        
+        # Global classification
+        if len(region_embeddings) == 1:
+            embedding = region_embeddings[0]
+            patch_class = w_logits
+        else:
+            embedding, _ = self.network.milAggregation(torch.stack(region_embeddings).squeeze())
+            patch_class = torch.cat(instance_class, dim=0)
+            
+            # Calculate region-level attention
+            stacked_embeddings = torch.stack(region_embeddings).squeeze()
+            attn_module = self.network.milAggregation.attentionModule
+            A_V = attn_module.attention_V(stacked_embeddings)
+            A_U = attn_module.attention_U(stacked_embeddings)
+            w_logits = attn_module.attention_weights(A_V * A_U)
+        
+        global_class = self.network.classifier(embedding).detach().cpu().numpy()
+        patch_class = patch_class.detach().cpu().numpy()
+        
+        # Map region classifications to patches
+        region_class_aux = w_logits.detach().cpu().numpy()
+        region_class = np.zeros(patch_class.shape)
+        region_info_np = region_info.detach().cpu().numpy()
+        
+        for i, region_id in enumerate(region_info_np):
+            region_class[i] = region_class_aux[int(region_id)]
+        
+        print('MIL classification: done')
+        return patch_class, region_class, global_class
 
-            # Normalize attention
-            min_max_att = np.load(self.dir_results + self.dir_inference + '/min_max_att.npy')
-            patch_classification = (patch_classification - min_max_att[0]) / (min_max_att[1] - min_max_att[0])
-            region_classification = (region_classification - min_max_att[0]) / (min_max_att[1] - min_max_att[0])
+    def _normalize_attention(self, patch_class, region_class, output_dir):
+        """Normalize attention scores using pre-computed min/max values"""
+        min_max_att = np.load(f"{self.dir_results}{self.dir_inference}/min_max_att.npy")
+        patch_class = (patch_class - min_max_att[0]) / (min_max_att[1] - min_max_att[0])
+        region_class = (region_class - min_max_att[0]) / (min_max_att[1] - min_max_att[0])
+        return patch_class, region_class
 
-            # Load thumbnail array for predictions
-            wsi_20x = pyvips.Image.new_from_file(
-                self.dir_wsi + self.current_wsi_name + ".mrxs", autocrop=True, level=2).flatten()
-            colormap_height = wsi_20x.height // self.ori_patch_size
-            colormap_width = wsi_20x.width // self.ori_patch_size
+    def _generate_visualizations(self, wsi_subfolder, patch_class, region_class, wsi_thumbnail, output_dir):
+        """Generate prediction colormaps and overlay visualizations"""
+        # Load high-res WSI for colormap dimensions
+        wsi_20x = pyvips.Image.new_from_file(
+            f"{self.dir_wsi}{self.current_wsi_name}.mrxs", autocrop=True, level=2).flatten()
+        colormap_h = wsi_20x.height // self.ori_patch_size
+        colormap_w = wsi_20x.width // self.ori_patch_size
+        
+        colormap_path = f"{output_dir}/prediction_colormap.npy"
+        if not os.path.exists(colormap_path):
+            # Initialize colormaps
+            pred_colormap = -np.ones((colormap_h, colormap_w), dtype=np.float32)
+            pred_colormap_reg = -np.ones((colormap_h, colormap_w), dtype=np.float32)
+            
+            # Fill colormaps with attention scores
+            patch_files = os.listdir(wsi_subfolder)
+            for i, (patch_att, reg_att, patch_file) in enumerate(zip(patch_class, region_class, patch_files)):
+                print(f"{i+1}/{len(patch_class)}", end='\r')
+                
+                x_coord = int(patch_file.split('_')[-1].split('.')[0])
+                y_coord = int(patch_file.split('_')[-2])
+                x_idx = x_coord // self.ori_patch_size
+                y_idx = y_coord // self.ori_patch_size
+                
+                pred_colormap[x_idx, y_idx] = patch_att
+                pred_colormap_reg[x_idx, y_idx] = reg_att
+            
+            # Save ROI masks
+            self._save_roi_masks(pred_colormap, pred_colormap_reg, wsi_thumbnail, output_dir)
+            
+            # Clean up colormaps
+            pred_colormap[pred_colormap == -1] = 0.
+            pred_colormap_reg[pred_colormap_reg == -1] = 0.
+            
+            # Save colormaps
+            np.save(colormap_path, pred_colormap)
+            np.save(f"{output_dir}/prediction_colormap_region.npy", pred_colormap_reg)
+            print('Prediction colormap: done')
+        else:
+            pred_colormap = np.load(colormap_path)
+            pred_colormap_reg = np.load(f"{output_dir}/prediction_colormap_region.npy")
+        
+        # Generate final overlay images
+        self._create_overlay_images(pred_colormap, pred_colormap_reg, wsi_thumbnail, output_dir)
 
-            if not os.path.exists(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/prediction_colormap.npy') or not os.path.exists(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/roi_patch_extraction.jpeg'):
-                prediction_colormap = -1 * np.ones((colormap_height, colormap_width), dtype=np.float32)
-                prediction_colormap_reg = -1 * np.ones((colormap_height, colormap_width), dtype=np.float32)
-                roi_mask = np.ones((colormap_height, colormap_width), dtype=np.float32)
-                roi_mask_reg = np.ones((colormap_height, colormap_width), dtype=np.float32)
+    def _save_roi_masks(self, pred_colormap, pred_colormap_reg, wsi_thumbnail, output_dir):
+        """Save ROI masks showing extracted patch regions"""
+        roi_mask = np.ones_like(pred_colormap, dtype=np.float32)
+        roi_mask[pred_colormap == -1] = 0
+        roi_mask = resize(roi_mask, (wsi_thumbnail.height, wsi_thumbnail.width))
+        Image.fromarray(np.uint8(roi_mask * 255)).save(f"{output_dir}/roi_patch_extraction.jpeg")
+        
+        roi_mask_reg = np.ones_like(pred_colormap_reg, dtype=np.float32)
+        roi_mask_reg[pred_colormap_reg == -1] = 0
+        roi_mask_reg = resize(roi_mask_reg, (wsi_thumbnail.height, wsi_thumbnail.width))
+        Image.fromarray(np.uint8(roi_mask_reg * 255)).save(f"{output_dir}/roi_reg_extraction.jpeg")
 
-                # Generate WSI map prediction with attention
-                for iInstance, (patch_attention_score, reg_attention_score, current_patch_filename) in enumerate(
-                        zip(patch_classification, region_classification, os.listdir(self.current_wsi_subfolder))):
-                    print(str(iInstance + 1) + '/' + str(patch_classification.shape[0]), end='\r')
-                    x_coordinate = int(current_patch_filename.split('_')[-1].split('.')[0])
-                    y_coordinate = int(current_patch_filename.split('_')[-2])
+    def _create_overlay_images(self, pred_colormap, pred_colormap_reg, wsi_thumbnail, output_dir):
+        """Create final overlay images with attention heatmaps"""
+        # Convert thumbnail to numpy array
+        wsi_alpha = np.ndarray(
+            buffer=wsi_thumbnail.write_to_memory(),
+            dtype=np.uint8,
+            shape=[wsi_thumbnail.height, wsi_thumbnail.width, wsi_thumbnail.bands])
+        
+        # Resize and smooth colormaps
+        pred_colormap = resize(pred_colormap, (wsi_thumbnail.height, wsi_thumbnail.width))
+        pred_colormap = pred_colormap ** 2  # Enhance contrast
+        pred_colormap = rank.mean(pred_colormap, disk(21))  # Smooth
+        
+        pred_colormap_reg = resize(pred_colormap_reg, (wsi_thumbnail.height, wsi_thumbnail.width))
+        pred_colormap_reg = pred_colormap_reg ** 2
+        pred_colormap_reg = rank.mean(pred_colormap_reg, disk(21))
+        
+        # Create blended images
+        alpha = 0.5
+        wsi_blended = ((plt.cm.jet(pred_colormap)[:, :, :3] * 255) * alpha + 
+                      wsi_alpha * (1 - alpha)).astype(np.uint8)
+        wsi_blended_reg = ((plt.cm.jet(pred_colormap_reg)[:, :, :3] * 255) * alpha + 
+                          wsi_alpha * (1 - alpha)).astype(np.uint8)
+        
+        # Remove background regions
+        background_mask = self._create_background_mask(wsi_thumbnail)
+        wsi_blended[background_mask == 0] = 255
+        wsi_blended_reg[background_mask == 0] = 255
+        
+        # Save final images
+        Image.fromarray(wsi_blended).save(f"{output_dir}/prediction.jpeg")
+        Image.fromarray(wsi_blended_reg).save(f"{output_dir}/prediction_region.jpeg")
+        print('Thumbnail: done')
 
-                    x_index = x_coordinate // self.ori_patch_size
-                    y_index = y_coordinate // self.ori_patch_size
+    def _create_background_mask(self, wsi_thumbnail):
+        """Create mask to exclude background regions"""
+        full_slide = wsi_thumbnail.extract_area(0, 0, wsi_thumbnail.width, wsi_thumbnail.height)
+        slide_numpy = np.frombuffer(full_slide.write_to_memory(), dtype=np.uint8).reshape(
+            full_slide.height, full_slide.width, 3)
+        
+        # Create mask based on green channel threshold
+        background_mask = np.ones((wsi_thumbnail.height, wsi_thumbnail.width))
+        background_mask[slide_numpy[:, :, 1] > 240] = 0
+        
+        # Morphological operations to clean up mask
+        background_mask = ndimage.binary_closing(background_mask, structure=np.ones((25, 25)))
+        background_mask = ndimage.binary_opening(background_mask, structure=np.ones((25, 25)))
+        background_mask = skimage.morphology.remove_small_objects(background_mask.astype(bool), min_size=5000)
+        
+        return background_mask
 
-                    # To be overlayed using alpha channel
-                    prediction_colormap[x_index, y_index] = patch_attention_score
-                    prediction_colormap_reg[x_index, y_index] = reg_attention_score
-
-                roi_mask[prediction_colormap == -1] = 0
-                roi_mask = resize(roi_mask, (wsi_thumbnail.height, wsi_thumbnail.width))
-                roi_image = Image.fromarray(np.uint8(roi_mask * 255))
-                roi_image.save(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/roi_patch_extraction.jpeg')
-
-                roi_mask_reg[prediction_colormap_reg == -1] = 0
-                roi_mask_reg = resize(roi_mask_reg, (wsi_thumbnail.height, wsi_thumbnail.width))
-                roi_image_reg = Image.fromarray(np.uint8(roi_mask_reg * 255))
-                roi_image_reg.save(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/roi_reg_extraction.jpeg')
-
-                prediction_colormap[prediction_colormap == -1] = 0.
-                prediction_colormap_reg[prediction_colormap_reg == -1] = 0.
-
-                # Save generated colormap
-                np.save(self.dir_results + self.dir_inference + self.current_wsi_name + '/prediction_colormap.npy',
-                        prediction_colormap)
-                np.save(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/prediction_colormap_region.npy',
-                    prediction_colormap_reg)
-                print('Prediction colormap: done')
-            else:
-                prediction_colormap = np.load(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/prediction_colormap.npy')
-                prediction_colormap_reg = np.load(
-                    self.dir_results + self.dir_inference + self.current_wsi_name + '/prediction_colormap_region.npy')
-
-            # Save thumbnail image and the overlayed colormap
-            wsi_alpha = np.ndarray(buffer=wsi_thumbnail.write_to_memory(),
-                                   dtype=np.uint8,
-                                   shape=[wsi_thumbnail.height, wsi_thumbnail.width, wsi_thumbnail.bands])
-
-            prediction_colormap = resize(prediction_colormap, (wsi_thumbnail.height, wsi_thumbnail.width))
-            prediction_colormap = prediction_colormap ** 2
-            prediction_colormap = rank.mean(prediction_colormap, disk(21))
-            prediction_colormap_reg = resize(prediction_colormap_reg, (wsi_thumbnail.height, wsi_thumbnail.width))
-            prediction_colormap_reg = prediction_colormap_reg ** 2
-            prediction_colormap_reg = rank.mean(prediction_colormap_reg, disk(21))
-
-            alpha = 0.5;
-            wsi_blended = ((plt.cm.jet(prediction_colormap)[:, :, :3] * 255) * alpha + wsi_alpha * (1 - alpha)).astype(
-                np.uint8)  # [:,:,:3]
-            wsi_blended_reg = (
-                        (plt.cm.jet(prediction_colormap_reg)[:, :, :3] * 255) * alpha + wsi_alpha * (1 - alpha)).astype(
-                np.uint8)  # [:,:,:3]
-
-            background_mask = np.ones((wsi_thumbnail.height, wsi_thumbnail.width))
-            full_slide = wsi_thumbnail.extract_area(0, 0, wsi_thumbnail.width, wsi_thumbnail.height)
-            slide_numpy = full_slide.write_to_memory()
-            slide_numpy = np.fromstring(slide_numpy, dtype=np.uint8).reshape(full_slide.height, full_slide.width, 3)
-
-            background_mask[slide_numpy[:, :, 1] > 240] = 0
-            background_mask = ndimage.binary_closing(background_mask, structure=np.ones((25, 25))).astype(
-                background_mask.dtype)
-            background_mask = ndimage.binary_opening(background_mask, structure=np.ones((25, 25))).astype(
-                background_mask.dtype)
-
-            background_mask = skimage.morphology.remove_small_objects(background_mask.astype(bool), min_size=5000)
-            wsi_blended[background_mask == 0] = 255
-            wsi_blended_reg[background_mask == 0] = 255
-
-            cm = plt.get_cmap('jet')
-            img = Image.fromarray(wsi_blended)
-            img.save(self.dir_results + self.dir_inference + self.current_wsi_name + '/prediction.jpeg')
-            img_reg = Image.fromarray(wsi_blended_reg)
-            img_reg.save(self.dir_results + self.dir_inference + self.current_wsi_name + '/prediction_region.jpeg')
-            print('Thumbnail: done')
-
-    def image_normalization(self, x):
-        # image resize
-        # x = cv2.resize(x, (self.input_shape[1], self.input_shape[2]))
-        # channel first
-        x = np.transpose(x, (2, 0, 1))
-        # intensity normalization
-        x = x / 255.0
-        # numeric type
-        x.astype('float32')
-        return x
+    def _normalize_image(self, x):
+        """Normalize image for neural network input"""
+        x = np.transpose(x, (2, 0, 1))  # Channel first
+        x = x / 255.0  # Normalize to [0,1]
+        return x.astype('float32')
 
 
-########################################################################################################################
-
-# Directory listing
-dir_out = 'results/nmil/'
-dir_inference = 'inference/'
-dir_images = 'extracted_tiles_of_.../'
-dir_images_regions = 'extracted_tiles_of_..._regions/'
-dir_wsi = 'WSIs/'
-
-# WSI to go through
-wsi_df = pd.read_excel('patient_set_split.xlsx')
-test_wsi = wsi_df.loc[wsi_df['Set'] == 'Test', 'WSI_OLD'].to_list()
-
-# Models
-backbone = torch.load('contrastive/models/backbone_....pth')
-network = torch.load(dir_out + '1_network_weights_best.pth')
-
-# Iterate over the patients
-inference = MILInference(dir_wsi, dir_out, backbone, network, dir_inference, dir_images_regions)
-for current_wsi_subfolder in reversed(test_wsi):
-    inference.infer(current_wsi_subfolder=dir_images + current_wsi_subfolder)
+# Main execution
+if __name__ == "__main__":
+    # Directory configuration
+    dir_out = 'results/nmil/'
+    dir_inference = 'inference/'
+    dir_images = 'extracted_tiles_of_.../'
+    dir_images_regions = 'extracted_tiles_of_..._regions/'
+    dir_wsi = 'WSIs/'
+    
+    # Load test WSI list
+    wsi_df = pd.read_excel('patient_set_split.xlsx')
+    test_wsi = wsi_df.loc[wsi_df['Set'] == 'Test', 'WSI_OLD'].to_list()
+    
+    # Load pre-trained models
+    backbone = torch.load('contrastive/models/backbone_....pth')
+    network = torch.load(f'{dir_out}1_network_weights_best.pth')
+    
+    # Run inference on all test WSIs
+    inference = MILInference(dir_wsi, dir_out, backbone, network, dir_inference, dir_images_regions)
+    for wsi_name in reversed(test_wsi):
+        inference.infer(current_wsi_subfolder=f"{dir_images}{wsi_name}")
