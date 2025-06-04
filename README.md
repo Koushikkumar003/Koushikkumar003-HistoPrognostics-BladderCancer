@@ -1,49 +1,80 @@
+Certainly! Here's the updated GitHub README for the HistoPrognostics project, with the license section removed as per your request:
+
+---
+
 # HistoPrognostics
 
-This is the source code described in the paper "Self-Contrastive Weakly Supervised Learning Framework for Prognostic Prediction Using Whole Slide Images" by Saul Fuster, Farbod Khoraminia, Julio Silva-Rodríguez, Umay Kiraz, Geert J. L. H. van Leenders, Trygve Eftestøl, Valery Naranjo, Emiel A.M. Janssen, Tahlita C.M. Zuiverloon, and Kjersti Engan  - under revision.
+This repository provides the implementation of the framework presented in the paper:
 
-### 1 - Abstract
-We present a pioneering investigation into the application of deep learning techniques to analyze histopathological images for addressing the substantial challenge of automated prognostic prediction. Prognostic prediction poses a unique challenge as the ground truth labels are inherently weak, and the model must anticipate future events that are not directly observable in the image. To address this challenge, we propose a novel three-part framework comprising of a convolutional network based tissue segmentation algorithm for region of interest delineation, a contrastive learning module for feature extraction, and a nested multiple instance learning classification module. Our study explores the significance of various regions of interest within the histopathological slides and exploits diverse learning scenarios. The pipeline is initially validated on artificially generated data and a simpler diagnostic task. Transitioning to prognostic prediction, tasks become more challenging. Employing bladder cancer as use case, our best models yield an AUC of 0.721 and 0.678 for recurrence and treatment outcome prediction respectively.
+**"Self-Contrastive Weakly Supervised Learning Framework for Prognostic Prediction Using Whole Slide Images"**
+*Authors: Saul Fuster, Farbod Khoraminia, Julio Silva-Rodríguez, Umay Kiraz, Geert J. L. H. van Leenders, Trygve Eftestøl, Valery Naranjo, Emiel A.M. Janssen, Tahlita C.M. Zuiverloon, and Kjersti Engan*
+*Status: Under revision*
 
-<p align="center">
-    <img src="images/pipeline overview.png">
-</p>
+## Overview
 
-### 2 - How to use
+HistoPrognostics is a deep learning framework designed to analyze histopathological whole slide images (WSIs) for prognostic prediction. The framework addresses the challenge of weakly labeled data by integrating three key components:
 
-This codebase implements a two-part framework for image analysis: a contrastive learning module for feature extraction and a nested Multiple Instance Learning (MIL) classification module. The system offers the flexibility to use feature embeddings alone, clinicopathological data, or a combination of both for image classification tasks.
+1. **Tissue Segmentation**: A convolutional neural network (CNN) based algorithm to delineate regions of interest (ROIs) within WSIs.
+2. **Contrastive Learning Module**: Extracts robust feature embeddings from the segmented ROIs using self-contrastive learning techniques.
+3. **Nested Multiple Instance Learning (MIL) Classifier**: Aggregates features from multiple ROIs to make slide-level prognostic predictions.
 
-**Contrastive Learning Module:**
-- The `main_XXX.py` scripts contain the implementation of a contrastive learning algorithm for training a convolutional neural network (CNN) backbone. Use `main_monoscale.py` and `main_multiscale.py` for single or tri-scale magnification inputs, respectively.
-- The network is trained to generate feature embeddings for input images by maximizing the similarity between positive pairs and minimizing the similarity between negative pairs.
-- You can configure the network architecture, loss function, and training hyperparameters in the script.
-- Pre-trained models can be saved and loaded for feature extraction. Also, feature embeddings are generated for posterior classification training.
+The framework has been validated on both synthetic datasets and real-world bladder cancer WSIs, achieving Area Under the Curve (AUC) scores of 0.721 for recurrence prediction and 0.678 for treatment outcome prediction.
 
-**Classification Module:**
-- The `main_nmil.py` script builds a nested MIL classification model.
-- It uses feature embeddings from the contrastive learning module, clinicopathological data, or both for image classification.
-- The nested MIL approach hierarchically combines information from image regions (bags) to make a final classification decision.
-- The script provides options for configuring the classifier architecture, handling multi-modal data, and specifying MIL pooling techniques.
-- You can easily switch between using feature embeddings, clinicopathological data, or a combination as input.
+![Pipeline Overview](images/pipeline%20overview.png)
 
-**Usage:**
-- Use the `main_XXX.py` script to train the contrastive learning module on your dataset. Provide data loaders and adjust training settings as needed.
-- After feature extraction, you can use the `main_nmil.py` script to train the nested MIL classifier. Specify the input data sources and adjust the model architecture according to your requirements.
-- The `inference.py` script allows you to perform inference on new images using the trained classification model.
-- The `logistic_regression.py` script provides performance insights on the trained classification model.
+## Getting Started
 
-**Dependencies:**
-- Ensure that you have the required dependencies listed in the `requirements.txt` file.
+### Prerequisites
 
-<p align="center">
-    <img src="images/heatmap.png">
-</p>
+Ensure you have the necessary dependencies installed. Refer to the `requirements.txt` file for a comprehensive list.
 
-### 3 - Link to paper
-TBA
+### Modules
 
-### 4 - How to cite our work
-The code is released free of charge as open-source software under the GPL-3.0 License. Please cite our paper if you use it in your research.
-```
-TBA
-```
+#### Contrastive Learning
+
+* **Scripts**: `main__monoscale.py` (single magnification), `main__multiscale.py` (multi-scale magnification)
+* **Functionality**:
+
+  * Train CNN backbones to generate feature embeddings by maximizing similarity between positive pairs and minimizing it between negative pairs.
+  * Configure network architecture, loss functions, and training hyperparameters within the scripts.
+  * Save and load pre-trained models for feature extraction.
+
+#### Classification
+
+* **Script**: `main__nmil.py`
+* **Functionality**:
+
+  * Builds a nested MIL classification model using extracted features, clinicopathological data, or a combination of both.
+  * Hierarchically combines information from image regions to make final predictions.
+  * Offers configuration options for classifier architecture, data modalities, and MIL pooling techniques.
+
+#### Inference and Evaluation
+
+* **Inference**: Use `inference.py` to perform predictions on new WSIs using the trained classification model.
+* **Evaluation**: `logistic_regression.py` provides performance metrics and insights into the trained model's efficacy.
+
+## Usage
+
+1. **Train Contrastive Model**:
+   Run `main__monoscale.py` or `main_multiscale.py` to train the contrastive learning module on your dataset. Adjust data loaders and training settings as needed.
+
+2. **Extract Features**:
+   Use the trained model to generate feature embeddings for your dataset.
+
+3. **Train Classifier**:
+   Run `main__nmil.py` to train the nested MIL classifier using the extracted features and/or clinicopathological data.
+
+4. **Inference**:
+   Use `inference.py` to make predictions on new WSIs.
+
+5. **Evaluate Performance**:
+   Run `logistic__regression.py` to assess the model's performance using various metrics.
+
+![Heatmap Visualization](images/Heatmap.png)
+
+## Citation
+
+If you utilize this framework in your research, please cite our work:
+
+*Citation details will be provided upon publication.*
+
